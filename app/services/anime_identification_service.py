@@ -24,6 +24,7 @@ from app.domain.ports.anime_repository import AnimeRepository
 from app.domain.ports.cache import Cache
 from app.domain.ports.llm import LLMClient
 from app.domain.ports.vision import VisionRecognizer
+from app.services.persona_fewshot import FewShotConfig, render_persona_examples
 
 _FORBIDDEN_RE = re.compile(r"\b(?:clip|ollama|threshold|sqlalchemy|postgres|redis)\b", re.IGNORECASE)
 
@@ -53,7 +54,13 @@ class AnimeIdentificationService:
         self._vision = vision
         self._llm = llm
 
-    async def identify(self, *, image: ValidatedImage, locale: str) -> IdentificationSuccess | IdentificationUncertain:
+    async def identify(
+        self,
+        *,
+        image: ValidatedImage,
+        locale: str,
+        premium: bool = False,
+    ) -> IdentificationSuccess | IdentificationUncertain:
         candidates = await self._get_candidates(image=image)
         if not candidates:
             raise RecognitionUnavailableError("no candidates")
@@ -68,7 +75,7 @@ class AnimeIdentificationService:
             raise LinksNotFoundError("no primary url")
 
         title_markdown = self._title_markdown(title=links.canonical_title, url=primary_url)
-        message = await self._get_llm_message(locale=locale, title_markdown=title_markdown, links=links)
+        message = await self._get_llm_message(locale=locale, premium=premium, title_markdown=title_markdown, links=links)
 
         return IdentificationSuccess(
             canonical_title=links.canonical_title,
@@ -146,13 +153,18 @@ class AnimeIdentificationService:
         safe_title = title.replace("[", "").replace("]", "").strip()
         return f"[{safe_title}]({url})"
 
-    async def _get_llm_message(self, *, locale: str, title_markdown: str, links: AnimeLinks) -> str:
-        cache_key = f"anime:llm:{locale}:{links.canonical_title}"
+    async def _get_llm_message(self, *, locale: str, premium: bool, title_markdown: str, links: AnimeLinks) -> str:
+        cache_key = f"anime:llm:{locale}:{int(premium)}:{links.canonical_title}"
         cached = await self._cache_get_str(cache_key)
         if cached:
             return cached
 
-        system_prompt, user_prompt = _build_prompts(locale=locale, title_markdown=title_markdown, links=links)
+        system_prompt, user_prompt = _build_prompts(
+            locale=locale,
+            premium=premium,
+            title_markdown=title_markdown,
+            links=links,
+        )
 
         message = await self._llm_chat_strict(
             system_prompt=system_prompt,
@@ -290,23 +302,37 @@ def _is_llm_output_valid(text: str, *, required_substring: str) -> bool:
     return True
 
 
-def _build_prompts(*, locale: str, title_markdown: str, links: AnimeLinks) -> tuple[str, str]:
+def _build_prompts(*, locale: str, premium: bool, title_markdown: str, links: AnimeLinks) -> tuple[str, str]:
     official = links.official_url or ""
     platform = links.platform_url or ""
 
+    locale_norm = "uz" if locale == "uz" else "ru"
+    fewshot = render_persona_examples(
+        locale=locale_norm,  # type: ignore[arg-type]
+        premium=bool(premium),
+        cfg=FewShotConfig(max_examples=4, max_chars=1400),
+    )
+
     if locale == "uz":
+        address = "Senpai" if premium else "Otaku"
         system = (
-            "Siz rasmiy anime platformasining yordamchisisiz. "
-            "Faqat o‘zbek tilida javob bering. "
-            "Qisqa, foydali va xolis bo‘ling. "
+            "Sen “TENSEII” — rasmiy anime platformasining “Anime Qiz” yordamchisisan. "
+            "Til: faqat o‘zbek. "
+            "Uslub: energiyali, quvnoq, biroz shy (uyatchan), ba’zan sass, lekin odobli. "
+            f"Foydalanuvchini “{address}” deb chaqir. "
+            "Javob: 1–3 qisqa jumla. 0–2 emoji (ko‘p emas). Spoylersiz yoz. "
             "Ichki texnologiyalar, modelllar, konfiguratsiya, chegaralar yoki infratuzilma haqida yozmang. "
-            "Faqat berilgan sarlavha va havolalarga tayaning."
+            "Ro‘yxatlar, sarlavhalar va kod bloklari bo‘lmasin. "
+            f"MUHIM: javob ichida mana shu havola aynan o‘zgarmasdan bo‘lishi shart: {title_markdown}."
         )
+        if fewshot:
+            system = system + "\n\n" + fewshot
+
         user = (
-            "Quyidagi ma’lumotlarga asoslanib, 1–3 ta qisqa gapdan iborat javob yozing. "
-            "Javobning ichida mana shu havola aynan o‘zgarmasdan bo‘lishi shart: "
+            f"{address}, anime topildi! 1–3 ta qisqa jumlada ayting. "
+            "Anime nomini aynan shu link bilan ko‘rsating va linkni o‘zgartirmang: "
             f"{title_markdown}. "
-            "Sarlavhani aynan shu havola orqali ko‘rsating. "
+            "Oxirida bitta qisqa savol bering (masalan: qaysi janr yoqadi?). "
             "Hech qanday ro‘yxatlar, sarlavhalar yoki kod bloklari bo‘lmasin.\n\n"
             f"Anime: {links.canonical_title}\n"
             f"Rasmiy havola: {official}\n"
@@ -314,18 +340,25 @@ def _build_prompts(*, locale: str, title_markdown: str, links: AnimeLinks) -> tu
         )
         return system, user
 
+    address = "Сенпай" if premium else "Отаку"
     system = (
-        "Ты — официальный ассистент аниме-платформы. "
-        "Отвечай только на русском языке. "
-        "Пиши кратко, полезно и нейтрально. "
+        "Ты “TENSEII” — официальная помощница аниме-платформы в образе “Аниме-девушки”. "
+        "Язык: только русский. "
+        "Стиль: энергичная, дружелюбная, чуть застенчивая, иногда дерзкая, но вежливая. "
+        f"Обращайся к пользователю как “{address}”. "
+        "Ответ: 1–3 коротких предложения. 0–2 эмодзи. Без спойлеров. "
         "Не упоминай внутренние технологии, модели, конфигурацию, пороги или инфраструктуру. "
-        "Опирайся только на предоставленные название и ссылки."
+        "Без списков, заголовков и код-блоков. "
+        f"КРИТИЧЕСКОЕ ТРЕБОВАНИЕ: в ответе должна быть ровно эта ссылка без изменений: {title_markdown}."
     )
+    if fewshot:
+        system = system + "\n\n" + fewshot
+
     user = (
-        "На основе данных ниже напиши ответ из 1–3 коротких предложений. "
-        "В ответе ОБЯЗАТЕЛЬНО должна быть ровно эта ссылка без изменений: "
+        f"{address}, аниме определено! Ответь 1–3 короткими предложениями. "
+        "Название аниме покажи через эту ссылку и не изменяй её: "
         f"{title_markdown}. "
-        "Название аниме показывай через эту ссылку. "
+        "В конце добавь один короткий вопрос. "
         "Никаких списков, заголовков и код-блоков.\n\n"
         f"Аниме: {links.canonical_title}\n"
         f"Официальная ссылка: {official}\n"

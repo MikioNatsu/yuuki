@@ -1,0 +1,16 @@
+
+# secrets
+.env
+
+# python cache
+__pycache__/
+*.pyc
+
+# temp
+tmp/
+*.log
+
+# local caches/models
+.cache/
+.hf/
+models/

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Header, Request, UploadFile
 
 from app.core.config import Settings
 from app.core.deps import anime_service_dep, locale_dep, settings_dep
@@ -19,14 +19,24 @@ from app.services.anime_identification_service import AnimeIdentificationService
 router = APIRouter()
 
 
+def _parse_premium_header(value: str | None) -> bool:
+    if value is None:
+        return False
+    v = value.strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
 @router.post("/anime/identify", response_model=IdentifyAnimeResponse)
 async def identify_anime(
     request: Request,
     file: UploadFile = File(...),
+    x_premium: str | None = Header(default=None, alias="X-Premium"),
     locale: str = Depends(locale_dep),
     settings: Settings = Depends(settings_dep),
     service: AnimeIdentificationService = Depends(anime_service_dep),
 ) -> IdentifyAnimeResponse:
+    premium = _parse_premium_header(x_premium)
+
     try:
         raw, sha256_hex = await read_upload_limited(
             upload=file,
@@ -49,10 +59,11 @@ async def identify_anime(
 
     rid = getattr(request.state, "request_id", "-") or "-"
 
-    result = await service.identify(image=image, locale=locale)
+    result = await service.identify(image=image, locale=locale, premium=premium)
     if isinstance(result, IdentificationUncertain):
         candidates_out = [
-            AnimeCandidateOut(title=c.title, confidence=c.confidence) for c in (result.candidates[:3] if result.candidates else [])
+            AnimeCandidateOut(title=c.title, confidence=c.confidence)
+            for c in (result.candidates[:3] if result.candidates else [])
         ]
         return IdentifyAnimeResponseUncertain(
             request_id=rid,
